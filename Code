@@ -1,0 +1,105 @@
+import streamlit as st
+import os
+from dotenv import load_dotenv
+
+# Modern 2026 Imports
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_community.vectorstores import FAISS
+from langchain_openai import OpenAIEmbeddings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain.agents import create_agent
+from langchain.tools import tool
+
+# 1. Setup Environment
+load_dotenv()
+DB_FAISS_PATH = 'vectorstore/db_faiss' # Local folder name
+
+st.set_page_config(page_title="Persistent PDF Agent", page_icon="💾")
+
+def create_vector_db(uploaded_file):
+    """Processes PDF and SAVES it locally."""
+    # Create directory if it doesn't exist
+    if not os.path.exists('vectorstore'):
+        os.makedirs('vectorstore')
+
+    temp_path = f"temp_{uploaded_file.name}"
+    with open(temp_path, "wb") as f:
+        f.write(uploaded_file.getbuffer())
+    
+    loader = PyPDFLoader(temp_path)
+    docs = loader.load()
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    splits = text_splitter.split_documents(docs)
+    
+    embeddings = OpenAIEmbeddings()
+    vectorstore = FAISS.from_documents(splits, embeddings)
+    
+    # --- CRITICAL STEP: Save locally ---
+    vectorstore.save_local(DB_FAISS_PATH)
+    
+    os.remove(temp_path)
+    return vectorstore
+
+def load_vector_db():
+    """Loads the FAISS index from the local disk."""
+    embeddings = OpenAIEmbeddings()
+    # allow_dangerous_deserialization=True is required for pickle-based loading
+    return FAISS.load_local(DB_FAISS_PATH, embeddings, allow_dangerous_deserialization=True)
+
+# --- UI Logic ---
+st.title("💾 Persistent RAG Agent")
+st.info("The index is saved locally in the 'vectorstore' folder.")
+
+with st.sidebar:
+    st.header("Document Management")
+    pdf_file = st.file_uploader("Upload PDF", type="pdf")
+    
+    # Check if a database already exists locally
+    db_exists = os.path.exists(DB_FAISS_PATH)
+    
+    if st.button("Process & Save Local") and pdf_file:
+        with st.spinner("Processing and saving..."):
+            create_vector_db(pdf_file)
+            st.success("Saved to local storage!")
+            st.rerun() # Refresh to update the 'db_exists' check
+
+# --- Agent Initialization ---
+if os.path.exists(DB_FAISS_PATH):
+    if "agent" not in st.session_state:
+        with st.spinner("Loading local index..."):
+            vector_db = load_vector_db()
+            retriever = vector_db.as_retriever()
+
+            @tool
+            def search_pdf(query: str) -> str:
+                """Search the local FAISS index for document information."""
+                docs = retriever.invoke(query)
+                return "\n\n".join([d.page_content for d in docs])
+
+            st.session_state.agent = create_agent(
+                model="openai:gpt-4o",
+                tools=[search_pdf],
+                system_prompt="Assistant for local PDF docs. Use search_pdf for answers."
+            )
+            st.session_state.messages = []
+else:
+    st.warning("No local index found. Please upload a PDF and click 'Process & Save Local'.")
+
+# --- Chat Interface ---
+if "agent" in st.session_state:
+    if "messages" not in st.session_state: st.session_state.messages = []
+
+    for m in st.session_state.messages:
+        with st.chat_message(m["role"]): st.markdown(m["content"])
+
+    if prompt := st.chat_input("Ask a question about the stored PDF"):
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"): st.markdown(prompt)
+
+        with st.chat_message("assistant"):
+            result = st.session_state.agent.invoke(
+                {"messages": [{"role": "user", "content": prompt}]}
+            )
+            answer = result["messages"][-1].content
+            st.markdown(answer)
+            st.session_state.messages.append({"role": "assistant", "content": answer})
